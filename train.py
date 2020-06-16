@@ -8,13 +8,17 @@ import argparse
 import os
 import csv
 # from tensorboardX import SummaryWriter
+import mlflow
+import mlflow.pytorch
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model", type=str, default='FashionSimpleNet', help="model")
 parser.add_argument("--patience", type=int, default=3, help="early stopping patience")
 parser.add_argument("--batch_size", type=int, default=256, help="batch size")
-parser.add_argument("--nepochs", type=int, default=200, help="max epochs")
-parser.add_argument("--nworkers", type=int, default=4, help="number of workers")
+parser.add_argument("--nepochs", type=int, default=1, help="max epochs")
+parser.add_argument("--lr", type=float, default=0.001, help="learning rate")
+parser.add_argument("--nworkers", type=int, default=1, help="number of workers")
 parser.add_argument("--seed", type=int, default=1, help="random seed")
 parser.add_argument("--data", type=str, default='MNIST', help="MNIST, or FashionMNIST")
 args = parser.parse_args()
@@ -51,8 +55,6 @@ os.mkdir(current_dir)
 logfile = open('{}/log.txt'.format(current_dir), 'w')
 print(args, file=logfile)
 
-
-
 # Define transforms.
 train_transforms = transforms.Compose([
     transforms.ToTensor(),
@@ -63,8 +65,10 @@ val_transforms = transforms.Compose([
     transforms.Normalize((0.1307,), (0.3081,))
 ])
 
-# Create dataloaders. Use pin memory if cuda.
+mlflow.set_tracking_uri("http://192.168.10.25:5000")
+mlflow.set_experiment(args.data)
 
+# Create dataloaders. Use pin memory if cuda.
 if args.data == 'FashionMNIST':
     trainset = datasets.FashionMNIST('./data', train=True, download=True, transform=train_transforms)
     train_loader = torch.utils.data.DataLoader(trainset, batch_size=args.batch_size,
@@ -93,7 +97,6 @@ def run_model(net, loader, criterion, optimizer, train = True):
     else:
         net.eval()
 
-
     for i, (X, y) in enumerate(loader):
         # Pass to gpu or cpu
         X, y = X.to(device), y.to(device)
@@ -119,58 +122,85 @@ def run_model(net, loader, criterion, optimizer, train = True):
 
 
 if __name__ == '__main__':
-
     # Init network, criterion and early stopping
     net = model.__dict__[args.model]().to(device)
     criterion = torch.nn.CrossEntropyLoss()
 
-
-
     # Define optimizer
-    optimizer = optim.Adam(net.parameters())
+    optimizer = optim.Adam(net.parameters(), args.lr)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=args.patience)
 
     # Train the network
     patience = args.patience
-    best_loss = 1e4
+    best_train_loss = 1e4
+    best_val_loss = 1e4
+    best_train_acc = 0.0
+    best_val_acc = 0.0
     writeFile = open('{}/stats.csv'.format(current_dir), 'a')
     writer = csv.writer(writeFile)
     writer.writerow(['Epoch', 'Train Loss', 'Train Accuracy', 'Validation Loss', 'Validation Accuracy'])
-    for e in range(args.nepochs):
-        start = time.time()
-        train_loss, train_acc = run_model(net, train_loader,
-                                      criterion, optimizer)
-        val_loss, val_acc = run_model(net, val_loader,
-                                      criterion, optimizer, False)
-        end = time.time()
+    with mlflow.start_run():
+        for e in range(args.nepochs):
+            start = time.time()
+            train_loss, train_acc = run_model(net, train_loader,
+                                          criterion, optimizer)
+            val_loss, val_acc = run_model(net, val_loader,
+                                          criterion, optimizer, False)
+            end = time.time()
 
-        # print stats
-        stats = """Epoch: {}\t train loss: {:.3f}, train acc: {:.3f}\t
-                val loss: {:.3f}, val acc: {:.3f}\t
-                time: {:.1f}s""".format(e+1, train_loss, train_acc, val_loss,
-                                        val_acc, end - start)
-        print(stats)
+            scheduler.step(val_loss)
 
-        # viz
-        # tsboard.add_scalar('data/train-loss',train_loss,e)
-        # tsboard.add_scalar('data/val-loss',val_loss,e)
-        # tsboard.add_scalar('data/val-accuracy',val_acc.item(),e)
-        # tsboard.add_scalar('data/train-accuracy',train_acc.item(),e)
+            # print stats
+            stats = """Epoch: {}\t train loss: {:.3f}, train acc: {:.3f}\t
+                    val loss: {:.3f}, val acc: {:.3f}\t
+                    time: {:.1f}s""".format(e+1, train_loss, train_acc, val_loss,
+                                            val_acc, end - start)
+            print(stats)
+
+            # viz
+            # tsboard.add_scalar('data/train-loss',train_loss,e)
+            # tsboard.add_scalar('data/val-loss',val_loss,e)
+            # tsboard.add_scalar('data/val-accuracy',val_acc.item(),e)
+            # tsboard.add_scalar('data/train-accuracy',train_acc.item(),e)
+
+#             mlflow.log_metric("train_loss", train_loss)
+            mlflow.log_metric(key="train_loss", value=train_loss, step=e)
+            mlflow.log_metric(key="val_loss", value=val_loss, step=e)
+            mlflow.log_metric(key="train_acc", value=train_acc.item(), step=e)
+            mlflow.log_metric(key="val_acc", value=val_acc.item(), step=e)
+            mlflow.log_param(key="lr", value=args.lr)
+
+            # Write to csv file
+            writer.writerow([e+1, train_loss, train_acc.item(), val_loss, val_acc.item()])
+            # early stopping and save best model
+            if val_loss < best_val_loss:
+                best_train_loss = train_loss
+                best_val_loss = val_loss
+                best_train_acc = train_acc
+                best_val_acc = val_acc
+                patience = args.patience
+                best_model_name = 'saved-models/{}-run-{}.pth.tar'.format(args.model, run)
+                utils.save_model({
+                    'arch': args.model,
+                    'state_dict': net.state_dict()
+                }, best_model_name)
+            # else:
+            #     patience -= 1
+            #     if patience == 0:
+            #         print('Run out of patience!')
+            #         writeFile.close()
+            #         # tsboard.close()
+            #         break
 
 
-        # Write to csv file
-        writer.writerow([e+1, train_loss, train_acc.item(), val_loss, val_acc.item()])
-        # early stopping and save best model
-        if val_loss < best_loss:
-            best_loss = val_loss
-            patience = args.patience
-            utils.save_model({
-                'arch': args.model,
-                'state_dict': net.state_dict()
-            }, 'saved-models/{}-run-{}.pth.tar'.format(args.model, run))
-        else:
-            patience -= 1
-            if patience == 0:
-                print('Run out of patience!')
-                writeFile.close()
-                # tsboard.close()
-                break
+        mlflow.log_param("model", args.model)
+        mlflow.log_param("batch_size", args.batch_size)
+        mlflow.log_param("epoch_number", args.nepochs)
+        mlflow.log_metric("best_train_loss", best_train_loss)
+        mlflow.log_metric("best_val_loss", best_val_loss)
+        mlflow.log_metric("best_train_acc", best_train_acc.item())
+        mlflow.log_metric("best_val_acc", best_val_acc.item())
+        mlflow.pytorch.log_model(net, "models", registered_model_name=args.model + '_' + args.data)
+        mlflow.log_artifact(best_model_name)
+
+
